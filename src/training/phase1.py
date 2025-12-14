@@ -10,7 +10,7 @@ from src.architecture.context_encoding.example_pair_encoder import ExamplePairEn
 from src.architecture.context_encoding.example_pair_aggregator import ExamplePairAggregator
 from src.architecture.context_encoding.conditional_encoder import ConditionalTestInputEncoder
 from src.architecture.LViTM.body import LargeVisionTransformerModel
-from src.architecture.executor.executor import Executor
+# from src.architecture.executor.diffuser import Executor
 from src.architecture.ViT.body import VisionTransformer
 
 # Training constants
