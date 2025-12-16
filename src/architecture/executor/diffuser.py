@@ -10,10 +10,10 @@ import os
 import torch
 from typing import cast
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
-from diffusers.pipelines.stable_diffusion.pipeline_output import (
-    StableDiffusionPipelineOutput,
-)
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+# from diffusers.pipelines.stable_diffusion.pipeline_output import (
+#     StableDiffusionPipelineOutput,
+# )
 
 MODEL_ID = "stabilityai/sdxl-turbo"  # relatively lightweight SD checkpoint
 OUTFILE = "out.png"

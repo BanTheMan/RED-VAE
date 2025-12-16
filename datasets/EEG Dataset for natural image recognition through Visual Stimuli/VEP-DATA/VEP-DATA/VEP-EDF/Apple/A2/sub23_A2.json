@@ -1,0 +1,37 @@
+{
+    "Markers": [
+    ],
+    "connectionType": "dongle",
+    "demographics": {
+        "UserType": "Researcher",
+        "birthday": "1983-01-01",
+        "countryOfInfluence": {
+            "iso": "IN",
+            "printable": "India"
+        },
+        "countryOfResidence": {
+            "iso": "IN",
+            "printable": "India"
+        },
+        "education": "Doctoral degree",
+        "gender": "F",
+        "handedness": "Right",
+        "languageAbility": "Bilingual",
+        "meditation": {
+            "answer": false,
+            "duration_frequency": "",
+            "duration_minute": "",
+            "length": "",
+            "length_unit": ""
+        },
+        "musicalAbility": "None",
+        "profession": "Computer and mathematical"
+    },
+    "exportApp": "com.emotiv.emotivpro",
+    "exportTime": "2024-08-06T18:37:34.636+05:30",
+    "headsetType": "EPOCX",
+    "mappings": null,
+    "montageType": "UNKNOWN",
+    "recordId": "8ab8fe0e-1d51-42c6-80b7-3a3363087faf",
+    "user": "shamama"
+}

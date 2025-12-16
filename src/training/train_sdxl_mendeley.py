@@ -16,7 +16,7 @@ import os
 import argparse
 import sys
 from dataclasses import dataclass
-from typing import Dict, Tuple, Any, cast
+from typing import Dict, Tuple, Any, Callable, Optional, cast
 from tqdm import tqdm
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -34,7 +34,11 @@ from torch.utils.data import Subset
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
+import hashlib
 from peft import LoraConfig
+from PIL import Image
+
+IMG_EXTS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 
 def debug_show_structure(p: str) -> None:
@@ -153,257 +157,279 @@ def pil_to_tensor_01(pil: Image.Image) -> torch.Tensor:
     return t
 
 
-class EEGImageNetDataset(torch.utils.data.Dataset):
-    """
-    Loader for EEG-ImageNet packaging where:
-      obj["dataset"] = list[dict]  (each dict is a trial/sample)
-      obj["images"]  = list[str]  (stimulus image identifiers/paths)
-      obj["labels"]  = list[str]  (class identifiers)
+@dataclass(frozen=True)
+class VEPSample:
+    eeg_path: Path
+    category: str      # e.g., "Apple", "Car", "Flower", "Human Face"
+    stim_id: str       # e.g., "A1", "C2", "F1", "P2"
 
-    Each sample dict typically contains:
-      - EEG data (tensor/ndarray/list)
-      - image reference (index into images, or a string path)
-      - label reference (index into labels, or a string)
 
-    Returns:
-      eeg_t: (1, C, T) float32
-      img_t: (3, H, W) float32 in [-1, 1]
+# ------------------ Mendeley VEP dataset ------------------
+
+class MendeleyVEPDataset(torch.utils.data.Dataset):
     """
+    Loader for:
+      EEG Dataset for natural image recognition through Visual Stimuli (Mendeley)
+
+    Expected extracted layout (as you showed):
+      <mendeley_root>/
+        VEP-DATA/VEP-DATA/
+          Participant_info.xlsx
+          VVIQuestionnaire.pdf
+          stimuli_images/
+            Apple/A1.png
+            Car/C1.jpg
+            Flower/F1.jpg
+            Human Face/P1.png
+            ...
+          VEP-CSV/<Category>/<StimulusID>/sub##_X#.csv (+ .json)
+          VEP-EDF/<Category>/<StimulusID>/sub##_X#.edf (+ .json)
+
+    Notes:
+    - This dataset DOES include your own stimuli_images folder (you added it). If stimuli_dir
+      is not provided, it defaults to: <mendeley_root>/VEP-DATA/VEP-DATA/stimuli_images
+    - EEG returned as torch.float32 with shape (1, C, T).
+    - Image returned as torch.float32 with shape (3, H, W) in [-1, 1].
+    """
+
+    IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
     def __init__(
         self,
-        eeg_pth_paths: list[str],
-        imagenet_root: str,
-        image_size: int = 224,
-        prefer_split: str = "train",  # unused here but kept for compatibility
+        mendeley_root: str | Path,
+        stimuli_dir: Optional[str | Path] = None,
+        *,
+        fmt: str = "csv",  # "csv" or "edf"
+        image_size: int = 512,
+        prefer_csv: bool = True,
+        strict_images: bool = True,  # if False, allows A2->A1, C2->C1, F2->F1, P2->P1 fallback
     ):
-        super().__init__()
-        self.imagenet_root = Path(imagenet_root)
+        self.root = Path(mendeley_root).expanduser().resolve()
+        self.fmt = fmt.lower().strip()
         self.image_size = int(image_size)
+        self.strict_images = bool(strict_images)
 
-        self.samples: list[dict] = []
-        self.images: list[str] = []
-        self.labels: list[str] = []
+        if not self.root.exists():
+            raise FileNotFoundError(f"Mendeley root not found: {self.root}")
 
-        for p in eeg_pth_paths:
-            obj = torch.load(p, map_location="cpu", weights_only=False)
-            if not isinstance(obj, dict):
-                raise ValueError(f"Expected dict in {p}, got {type(obj)}")
+        base = self._find_vep_data_base(self.root)
+        if base is None:
+            raise FileNotFoundError(
+                "Could not locate 'VEP-CSV' / 'VEP-EDF' under the provided root. "
+                "Expected something like: <root>/VEP-DATA/VEP-DATA/VEP-CSV/..."
+            )
 
-            ds = obj.get("dataset", None)
-            ims = obj.get("images", None)
-            lbs = obj.get("labels", None)
+        # Default stimuli_dir to the in-dataset stimuli_images you created
+        if stimuli_dir is None:
+            self.stimuli_dir = base / "stimuli_images"
+        else:
+            self.stimuli_dir = Path(stimuli_dir).expanduser().resolve()
 
-            if not isinstance(ds, list) or len(ds) == 0 or not isinstance(ds[0], dict):
-                raise TypeError(f"{p}: expected obj['dataset'] to be list[dict], got {type(ds)}")
+        if not self.stimuli_dir.exists():
+            raise FileNotFoundError(
+                f"stimuli_dir not found: {self.stimuli_dir}\n"
+                f"(If you put stimuli_images inside the dataset, you can omit --stimuli_dir "
+                f"and it will default to: {base / 'stimuli_images'})"
+            )
 
-            if not isinstance(ims, list) or (len(ims) > 0 and not isinstance(ims[0], str)):
-                raise TypeError(f"{p}: expected obj['images'] to be list[str], got {type(ims)}")
+        vep_csv = base / "VEP-CSV"
+        vep_edf = base / "VEP-EDF"
 
-            if not isinstance(lbs, list) or (len(lbs) > 0 and not isinstance(lbs[0], str)):
-                raise TypeError(f"{p}: expected obj['labels'] to be list[str], got {type(lbs)}")
+        if self.fmt not in ("csv", "edf"):
+            raise ValueError(f"fmt must be 'csv' or 'edf', got {self.fmt}")
 
-            self.samples.extend(ds)
-            # NOTE: Some releases repeat identical images/labels across parts; we just extend.
-            self.images.extend(ims)
-            self.labels.extend(lbs)
+        if self.fmt == "csv":
+            if not vep_csv.exists():
+                # fallback if user picked csv but only edf exists
+                if vep_edf.exists() and prefer_csv is False:
+                    self.fmt = "edf"
+                else:
+                    raise FileNotFoundError(f"CSV folder not found: {vep_csv}")
+            self.data_root = vep_csv
+        else:
+            if not vep_edf.exists():
+                raise FileNotFoundError(f"EDF folder not found: {vep_edf}")
+            self.data_root = vep_edf
 
+        self.samples: list[dict[str, Any]] = self._index_samples()
         if len(self.samples) == 0:
-            raise ValueError("No samples loaded.")
+            raise RuntimeError(f"No EEG files found under: {self.data_root}")
 
-        # Print a useful schema peek (first sample keys)
-        print("[EEGImageNetDataset] Loaded:")
-        print("  samples:", len(self.samples))
-        print("  images:", len(self.images))
-        print("  labels:", len(self.labels))
-        print("  sample0 keys:", list(self.samples[0].keys())[:50])
+        # Image preprocessing: force to image_size x image_size; output [-1, 1]
+        self._img_tf: Callable[[Image.Image], torch.Tensor] = T.Compose([
+            T.Resize((self.image_size, self.image_size), interpolation=T.InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+
+    @staticmethod
+    def _find_vep_data_base(root: Path) -> Path | None:
+        """
+        Returns the directory that contains VEP-CSV and/or VEP-EDF.
+        In your structure: <root>/VEP-DATA/VEP-DATA/
+        """
+        cand = root / "VEP-DATA" / "VEP-DATA"
+        if cand.exists() and cand.is_dir():
+            if (cand / "VEP-CSV").exists() or (cand / "VEP-EDF").exists():
+                return cand
+
+        # Otherwise, search
+        for p in root.rglob("VEP-CSV"):
+            if p.is_dir():
+                return p.parent
+        for p in root.rglob("VEP-EDF"):
+            if p.is_dir():
+                return p.parent
+        return None
+
+    def _index_samples(self) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        eeg_paths = sorted(self.data_root.rglob("*.csv" if self.fmt == "csv" else "*.edf"))
+
+        for eeg_path in eeg_paths:
+            # .../<Category>/<StimulusID>/sub##_A1.csv
+            stim_id = eeg_path.parent.name           # A1, A2, C1, C2, F1, F2, P1, P2
+            category = eeg_path.parent.parent.name   # Apple, Car, Flower, Human Face
+
+            json_path = eeg_path.with_suffix(".json")
+            samples.append({
+                "eeg_path": eeg_path,
+                "json_path": json_path if json_path.exists() else None,
+                "category": category,
+                "stim_id": stim_id,
+            })
+        return samples
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
+        eeg_path: Path = s["eeg_path"]
+        category: str = s["category"]
+        stim_id: str = s["stim_id"]
 
-        eeg = self._extract_eeg(s)
+        eeg = self._load_eeg(eeg_path)
         eeg = self._ensure_eeg_ct(eeg)
-        eeg_t = eeg.unsqueeze(0)  # (1,C,T)
+        eeg_t = eeg.unsqueeze(0)  # (1, C, T)
 
-        img_path = self._extract_image_path(s)
+        img_path = self._resolve_stimulus_image(category, stim_id, eeg_path)
         img_t = self._load_and_preprocess_image(img_path)
 
         return eeg_t, img_t
 
-    # ------------------ extraction helpers ------------------
+    # ------------------ EEG loading ------------------
 
-    def _extract_eeg(self, s: dict) -> torch.Tensor:
-        # common key guesses for EEG
-        for k in ("eeg", "EEG", "signal", "signals", "data", "eeg_data", "eeg_signal"):
-            if k in s:
-                return self._as_tensor(s[k]).to(torch.float32)
+    def _load_eeg(self, path: Path) -> torch.Tensor:
+        if self.fmt == "csv":
+            return self._load_csv_eeg(path)
+        return self._load_edf_eeg(path)
 
-        # last resort: search for first tensor/ndarray-like that is 2D (C,T) or 1D (flattened)
-        for k, v in s.items():
-            if torch.is_tensor(v):
-                if v.ndim in (1, 2, 3):
-                    return v.to(torch.float32)
-            if isinstance(v, np.ndarray) and v.ndim in (1, 2, 3):
-                return torch.from_numpy(v).to(torch.float32)
+    def _load_csv_eeg(self, path: Path) -> torch.Tensor:
+        # Try detect header (non-numeric first token)
+        first = path.read_text(encoding="utf-8", errors="ignore").splitlines()[:2]
+        skip = 0
+        if first:
+            tok = first[0].split(",")[0].strip()
+            try:
+                float(tok)
+            except Exception:
+                skip = 1
 
-        raise KeyError(f"Could not find EEG in sample keys={list(s.keys())[:50]}")
+        try:
+            arr = np.loadtxt(path, delimiter=",", skiprows=skip, dtype=np.float32)
+        except Exception:
+            arr = np.loadtxt(path, delimiter=";", skiprows=skip, dtype=np.float32)
 
-    def _extract_image_path(self, s: dict) -> Path:
-        """
-        Handle either:
-          - sample contains an int index into self.images
-          - sample contains a string path/name directly
-        """
-        # common key guesses
-        for k in ("image", "img", "image_path", "img_path", "stimulus", "image_name", "filename"):
-            if k in s:
-                v = s[k]
-                if isinstance(v, int):
-                    return self._resolve_image_string(self.images[v])
-                if torch.is_tensor(v) and v.numel() == 1:
-                    return self._resolve_image_string(self.images[int(v.item())])
-                if isinstance(v, str):
-                    return self._resolve_image_string(v)
+        if arr.ndim == 1:
+            arr = arr[None, :]
 
-        # index-style keys
-        for k in ("image_idx", "img_idx", "image_index", "img_index", "stimulus_idx"):
-            if k in s:
-                v = s[k]
-                if isinstance(v, int):
-                    return self._resolve_image_string(self.images[v])
-                if torch.is_tensor(v) and v.numel() == 1:
-                    return self._resolve_image_string(self.images[int(v.item())])
+        # Heuristic: if time is rows and channels is cols, flip to (C, T)
+        if arr.shape[0] > arr.shape[1] and arr.shape[1] <= 256:
+            arr = arr.T
 
-        # last resort: if sample has 'images' entry itself
-        if "images" in s and isinstance(s["images"], str):
-            return self._resolve_image_string(s["images"])
+        return torch.tensor(arr, dtype=torch.float32)
 
-        raise KeyError(
-            "Could not find image reference in sample. "
-            f"Sample keys={list(s.keys())[:50]} and images list length={len(self.images)}"
-        )
+    def _load_edf_eeg(self, path: Path) -> torch.Tensor:
+        try:
+            import mne  # type: ignore
+        except Exception as e:
+            raise ImportError("EDF reading requires 'mne'. Install with: uv pip install mne") from e
 
-    def _resolve_image_string(self, image_str: str) -> Path:
-        """
-        image_str might be:
-          - relative path like 'train/n01440764/xxx.JPEG'
-          - file name like 'n01440764_10026.JPEG'
-          - sometimes prefixed directories
+        raw = mne.io.read_raw_edf(str(path), preload=True, verbose="ERROR")
 
-        We try a few reasonable joins.
-        """
-        # 1) direct under root
-        p = self.imagenet_root / image_str
-        if p.exists():
-            return p
+        # Force numpy array (and make type-checkers happy)
+        data = np.asarray(raw.get_data(), dtype=np.float32)  # (C, T)
 
-        # 2) common ImageNet subfolders
-        for sub in ("train", "val", "ILSVRC2012_img_train", "ILSVRC2012_img_val"):
-            p2 = self.imagenet_root / sub / image_str
-            if p2.exists():
-                return p2
+        return torch.from_numpy(data)  # already float32
 
-        # 3) if image_str already contains 'train/' or 'val/', the direct join would’ve worked.
-        # nothing matched:
-        raise FileNotFoundError(
-            f"Could not resolve image '{image_str}' under ImageNet root '{self.imagenet_root}'. "
-            "You may need a custom resolver depending on how 'images' strings are formatted."
-        )
-
-    @staticmethod
-    def _as_tensor(x: Any) -> torch.Tensor:
-        if torch.is_tensor(x):
-            return x
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x)
-        return torch.tensor(x)
 
     @staticmethod
     def _ensure_eeg_ct(eeg: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure (C,T).
-        If it is (T,C) swap.
-        If it is (N,C,T) etc, user should fix upstream, but we handle common 2D case.
-        """
+        if eeg.ndim == 1:
+            return eeg.unsqueeze(0)
         if eeg.ndim == 2:
-            # heuristic: channels usually smaller than time
-            if eeg.shape[0] > eeg.shape[1]:
-                # likely (T,C) -> (C,T)
-                eeg = eeg.transpose(0, 1).contiguous()
             return eeg
-        if eeg.ndim == 3:
-            # sometimes stored as (1,C,T) already
-            if eeg.shape[0] == 1:
-                return eeg[0]
-        raise ValueError(f"Unexpected EEG shape {tuple(eeg.shape)}; expected (C,T) or (1,C,T).")
+        return eeg.reshape(eeg.shape[0], -1)
 
-    def _load_and_preprocess_image(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert("RGB")
-        img = img.resize((self.image_size, self.image_size), resample=Image.Resampling.BICUBIC)
-        arr = np.array(img, dtype=np.float32) / 255.0  # (H,W,3) [0,1]
-        t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3,H,W)
-        t = t * 2.0 - 1.0  # [-1,1]
-        return t
+    # ------------------ image resolution/loading ------------------
+
+    def _resolve_stimulus_image(self, category: str, stim_id: str, eeg_path: Path) -> Path:
+        """
+        Your current stimuli layout is:
+          stimuli_images/<Category>/<StimulusID>.<ext>
+        (not a folder per StimulusID)
+        """
+
+        # 1) stimuli_dir/<Category>/<StimulusID>.<ext>
+        cat_dir = self.stimuli_dir / category
+        for ext in self.IMG_EXTS:
+            cand = cat_dir / f"{stim_id}{ext}"
+            if cand.exists():
+                return cand
+
+        # 2) stimuli_dir/<StimulusID>.<ext> (optional alternate)
+        for ext in self.IMG_EXTS:
+            cand = self.stimuli_dir / f"{stim_id}{ext}"
+            if cand.exists():
+                return cand
+
+        # 3) stimuli_dir/<Category>.<ext> (category-level fallback)
+        for ext in self.IMG_EXTS:
+            cand = self.stimuli_dir / f"{category}{ext}"
+            if cand.exists():
+                return cand
+
+        # 4) Optional fallback: A2->A1, C2->C1, F2->F1, P2->P1
+        if not self.strict_images:
+            fallback = self._fallback_stim_id(stim_id)
+            if fallback != stim_id:
+                return self._resolve_stimulus_image(category, fallback, eeg_path)
+
+        raise FileNotFoundError(
+            f"Could not find a stimulus image for category='{category}', stim_id='{stim_id}'.\n"
+            f"stimuli_dir={self.stimuli_dir}\n"
+            f"Tried:\n"
+            f"  - {cat_dir}/{stim_id}.*\n"
+            f"  - {self.stimuli_dir}/{stim_id}.*\n"
+            f"  - {self.stimuli_dir}/{category}.*\n"
+            f"Extensions: {self.IMG_EXTS}\n"
+            f"If you only have A1/C1/F1/P1 images, set strict_images=False."
+        )
+
+    @staticmethod
+    def _fallback_stim_id(stim_id: str) -> str:
+        if len(stim_id) == 2 and stim_id[1] == "2":
+            return stim_id[0] + "1"
+        return stim_id
+
+    def _load_and_preprocess_image(self, img_path: Path) -> torch.Tensor:
+        img = Image.open(img_path).convert("RGB")
+        return self._img_tf(img)
 
 
-class BrainImageNPZDataset(torch.utils.data.Dataset):
-    """
-    Loads a preprocessed .npz dataset with:
-      eeg:    (N, n_channels, n_timepoints) float32
-      images: (N, 224, 224, 3) uint8
-      labels: (N,) strings (optional for diffusion training)
 
-    Returns:
-      eeg_2d:  (1, n_channels, n_timepoints) float32  (treated as a 2D grid)
-      image:   (3, 224, 224) float32 in [-1, 1]
-    """
-
-    def __init__(self, npz_path: str):
-        npz_path = str(npz_path)
-        if not Path(npz_path).exists():
-            raise FileNotFoundError(f"Dataset not found: {npz_path}")
-
-        data = np.load(npz_path, allow_pickle=True)
-        self.eeg = data["eeg"]          # (N, C, T) float32
-        self.images = data["images"]    # (N, 224, 224, 3) uint8
-        self.labels = data.get("labels", None)
-
-        # Basic sanity checks
-        if self.eeg.ndim != 3:
-            raise ValueError(f"Expected eeg shape (N,C,T), got {self.eeg.shape}")
-        if self.images.ndim != 4 or self.images.shape[-1] != 3:
-            raise ValueError(f"Expected images shape (N,H,W,3), got {self.images.shape}")
-
-        # Force dtypes
-        if self.eeg.dtype != np.float32:
-            self.eeg = self.eeg.astype(np.float32)
-
-        if self.images.dtype != np.uint8:
-            # If already float, we can still handle it below, but teammate said uint8.
-            self.images = self.images.astype(np.uint8)
-
-    def __len__(self) -> int:
-        return int(self.eeg.shape[0])
-
-    def __getitem__(self, idx: int):
-        eeg = self.eeg[idx]      # (C,T) float32
-        img = self.images[idx]   # (H,W,3) uint8
-
-        # EEG -> torch (1, C, T) to behave like a 2D "image"
-        eeg_t = torch.from_numpy(eeg).unsqueeze(0)  # (1, C, T)
-
-        # Image uint8 [0..255] -> float32 [-1..1], channel-first
-        img_t = torch.from_numpy(img).permute(2, 0, 1).contiguous()  # (3,H,W), uint8
-        img_t = img_t.to(torch.float32) / 255.0
-        img_t = img_t * 2.0 - 1.0  # [-1, 1]
-
-        return eeg_t, img_t
-    
-
-def make_splits(dataset: EEGImageNetDataset, test_size: float, seed: int) -> tuple[Subset, Subset]:
+def make_splits(dataset: MendeleyVEPDataset, test_size: float, seed: int) -> tuple[Subset, Subset]:
     """
     Deterministically split dataset into train/test subsets.
     """
@@ -808,10 +834,36 @@ def main():
         help="One or more EEG-ImageNet part .pth files (1 and/or 2)."
     )
     parser.add_argument(
-        "--imagenet_root", 
-        type=str, 
-        required=True,
-        help="Path to your local ImageNet root folder."
+        "--dataset",
+        type=str,
+        default="mendeley",
+        choices=["mendeley", "eeg_imagenet", "npz"],
+        help="Which dataset loader to use."
+    )
+    parser.add_argument(
+        "--mendeley_root",
+        type=str,
+        default="datasets/EEG Dataset for natural image recognition through Visual Stimuli",
+        help="Root folder where the Mendeley dataset was extracted."
+    )
+    parser.add_argument(
+        "--mendeley_format",
+        type=str,
+        default="csv",
+        choices=["csv", "edf"],
+        help="Whether to load EEG from VEP-CSV or VEP-EDF."
+    )
+    parser.add_argument(
+        "--stimuli_dir",
+        type=str,
+        default="./datasets/EEG Dataset for natural image recognition through Visual Stimuli/VEP-DATA/VEP-DATA/stimuli_images",
+        help="Folder containing stimulus images (see script docstring for expected layout)."
+    )
+    parser.add_argument(
+        "--imagenet_root",
+        type=str,
+        default=None,
+        help="Path to your local ImageNet root folder (required if --dataset eeg_imagenet)."
     )
 
 
@@ -896,11 +948,15 @@ def main():
     # debug_show_structure(args.eeg_imagenet_parts[0])
     # sys.exit(0)
 
-    ds = EEGImageNetDataset(
-        eeg_pth_paths=args.eeg_imagenet_parts,
-        imagenet_root=args.imagenet_root,
-        image_size=224,
+    # ------------------ dataset selection ------------------
+    ds = MendeleyVEPDataset(
+        mendeley_root=args.mendeley_root,
+        stimuli_dir=None,
+        fmt=args.mendeley_format,
+        image_size=512,
+        strict_images=False
     )
+
     e0, im0 = ds[0]
     print("Example EEG:", e0.shape, e0.dtype, "Example IMG:", im0.shape, im0.dtype, im0.min().item(), im0.max().item())
     train_ds, test_ds = make_splits(ds, test_size=args.test_size, seed=args.seed)
