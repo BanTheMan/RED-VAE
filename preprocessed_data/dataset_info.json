@@ -1,0 +1,35 @@
+{
+  "n_examples": 887,
+  "n_subjects": 1,
+  "subjects": [
+    "sub-002"
+  ],
+  "eeg_shape": [
+    887,
+    74,
+    250
+  ],
+  "images_shape": [
+    887,
+    224,
+    224,
+    3
+  ],
+  "labels": [
+    "unfamiliar",
+    "famous",
+    "scrambled"
+  ],
+  "label_counts": {
+    "scrambled": 297,
+    "unfamiliar": 295,
+    "famous": 295
+  },
+  "sampling_freq": 250.0,
+  "epoch_duration": 1.0,
+  "preprocessing": [
+    "Bandpass filter: 0.1-40 Hz",
+    "Z-score normalization per channel",
+    "Images resized to 224x224"
+  ]
+}
